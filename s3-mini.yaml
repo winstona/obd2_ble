@@ -50,11 +50,21 @@ obd2_ble:
   characteristic_uuid:
     write: "0xFFF2"
     notify: "0xFFF1"
-  #init_commands: "ATD ATE0 ATL0 ATH0 ATS0 ATSP0 ATDPN 0100 0120 0140 0160 0180 01A0 01C0 050100 0600 0900"
+  #init_commands: "ATZ ATE0 ATL0 ATS0 ATH1 ATSP0 ATDPN 0100"
   #command_delay: 1000
   #command_wait: 5000
+  #response_wait: 10000
+  #publish_delay: 500
+  #disconnect_delay: 600000
 
 sensor:
+  - platform: obd2_ble
+    obd2_ble_id: mycar
+    name: "ATRV"
+    mode: "AT"
+    pid: "RV"
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
   - platform: obd2_ble
     obd2_ble_id: mycar
     name: "Engine RPM"
