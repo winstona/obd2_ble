@@ -1,6 +1,7 @@
 #include "obd2_ble.h"
 #include "esphome/core/log.h"
 #include "esp_task_wdt.h"
+#include <regex>
 
 #ifdef USE_ESP32
 
@@ -34,12 +35,12 @@ void OBD2BLEClient::loop() {
   
   if (current_task_index_ < task_queue_.size()) {
     OBD2Task &task = task_queue_[current_task_index_];
-    process_task(task, command_delay_, command_wait_);
+    process_task(task, command_delay_, command_wait_, response_wait_, publish_delay_, disconnect_delay_);
     if (task.status == DONE || (task.status == ERROR && task.ignore_error)) {
       current_task_index_++;
     }
   } else {
-    ESP_LOGD(TAG, "Task completed. Disconnecting from OBD2 adapter...");
+    // ESP_LOGD(TAG, "Task completed. Disconnecting from OBD2 adapter...");
     this->disconnect();
   }
 }
@@ -82,7 +83,7 @@ void OBD2BLEClient::dump_config() {
 }
 
 void OBD2BLEClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
-  ESP_LOGD(TAG, "GATT Event: %d", event);
+  ESP_LOGV(TAG, "GATT Event: %d", event);
   switch (event) {
     case ESP_GATTC_REG_EVT:
       ESP_LOGD(TAG, "GATT client is registered.");
@@ -210,43 +211,59 @@ void OBD2BLEClient::string_to_uuid(const std::string &uuid_str, espbt::ESPBTUUID
   }
 }
 
-void OBD2BLEClient::process_task(OBD2Task &task, const int &delay, const int &wait) {
+void OBD2BLEClient::process_task(OBD2Task &task, const int &command_delay, const int &command_wait, const int &response_wait, const int &publish_delay, const int &disconnect_delay) {
   unsigned long current_time = millis();
-  if (current_time - last_command_time_ >= delay) {
+  if (current_time - last_command_time_ >= command_delay) {
     switch (task.status) {
       case PENDING:
         ESP_LOGD(TAG, "Sending command: %s", task.command.c_str());
         request_write(task.command);
+        //request_read();
         last_command_ = task.command;
         last_command_time_ = current_time;
         task.status = SENDING;
         break;
       case SENDING:
-        if (current_time - last_command_time_ >= wait) {
+        if (current_time - last_command_time_ >= command_wait) {
           ESP_LOGW(TAG, "Confirmation timeout for command: %s", task.command.c_str());
-          last_command_time_ = current_time;
           task.status = ERROR;
         }
         break;
       case SENT:
-        if (current_time - last_command_time_ >= wait) {
+        if (current_time - last_command_time_ >= response_wait) {
           ESP_LOGW(TAG, "Response timeout for command: %s", task.command.c_str());
           task.status = ERROR;
         }
         break;
       case RECEIVED:
         ESP_LOGD(TAG, "Processing response for command: %s", task.command.c_str());
-        parse_data(task);
-        task.status = DONE;
+        if (parse_data(task)) {
+          task.status = PUBLISHING;
+        } else {
+          task.status = ERROR;
+        }
+        break;
+      case PUBLISHING:
+        if (current_time - last_publish_time_ >= publish_delay) {
+          ESP_LOGD(TAG, "Publishing response for command: %s", task.command.c_str());
+          publish_data(task);
+          if (task.published) {
+            task.status = DONE;
+          } else {
+            last_publish_time_ = current_time;
+          }
+        }
         break;
       case DONE:
         ESP_LOGI(TAG, "DONE task for command: %s", task.command.c_str());
         break;
       case ERROR:
-        ESP_LOGE(TAG, "Task error for command: %s", task.command.c_str());
+        //ESP_LOGE(TAG, "Task error for command: %s", task.command.c_str());
         if (!task.ignore_error) {
-          ESP_LOGW(TAG, "Task cancelled. Disconnecting from OBD2 adapter...");
-          this->disconnect();
+          if (current_time - last_command_time_ >= disconnect_delay) {
+            ESP_LOGW(TAG, "Task cancelled. Disconnecting from OBD2 adapter...");
+            this->disconnect();
+          }
         }
         break;
       default:
@@ -262,7 +279,7 @@ void OBD2BLEClient::request_write(const std::string &command) {
     return;
   }
   std::string command_with_cr = command + "\r";
-  ESP_LOGD(TAG, "Sending AT command: %s", command_with_cr.c_str());
+  //ESP_LOGD(TAG, "Sending AT command: %s", command_with_cr.c_str());
   auto status = esp_ble_gattc_write_char(
       this->parent_->get_gattc_if(),
       this->parent_->get_conn_id(),
@@ -297,15 +314,16 @@ void OBD2BLEClient::disconnect() {
     ESP_LOGI(TAG, "Disconnecting from device, gattc_if: %d, conn_id: %d", gattc_if_, conn_id_);
     esp_ble_gattc_close(gattc_if_, conn_id_);
     cleanup();
-  } else {
-    ESP_LOGW(TAG, "No connection to disconnect");
   }
 }
 
 void OBD2BLEClient::on_write() {
   if (current_task_index_ < task_queue_.size()) {
     OBD2Task &task = task_queue_[current_task_index_];
-    if (task.status == PENDING || task.status == SENDING) task.status = SENT;
+    if (task.status == PENDING || task.status == SENDING) {
+      task.status = SENT;
+      //ESP_LOGD(TAG, "Sent command: %s", task.command.c_str());
+    }
     ESP_LOGD(TAG, "GATT characteristic write operation completes: %s.", task.command.c_str());
   } else {
     ESP_LOGW(TAG, "GATT write event received, but no current task available!");
@@ -313,7 +331,7 @@ void OBD2BLEClient::on_write() {
 }
 
 void OBD2BLEClient::on_notify(const std::vector<uint8_t> &data) {
-  ESP_LOGD(TAG, "Received data: %s", format_hex_pretty(data).c_str());
+  //ESP_LOGD(TAG, "Received data: %s", format_hex_pretty(data).c_str());
   
   if (current_task_index_ < task_queue_.size()) {
     response_buffer_.insert(response_buffer_.end(), data.begin(), data.end());
@@ -331,15 +349,18 @@ void OBD2BLEClient::on_disconnect() {
 
 void OBD2BLEClient::parse_response() {
   if (!response_buffer_.empty() && response_buffer_.back() == 0x3E) {
+    ESP_LOGD(TAG, "Received data in hex: %s", format_hex_pretty(response_buffer_).c_str());
     std::string response(response_buffer_.begin(), response_buffer_.end());
     std::replace(response.begin(), response.end(), '\r', ' ');
-    ESP_LOGD(TAG, "Complete response received: %s", response.c_str());
+    std::replace(response.begin(), response.end(), '\0', ' ');
+    ESP_LOGD(TAG, "Received data in str: %s", response.c_str());
     
     std::vector<std::vector<uint8_t>> lines;
     std::vector<uint8_t> line;
     for (auto byte : response_buffer_) {
       if (byte == 0x0D) {
         if (!line.empty()) {
+          //ESP_LOGD(TAG, "Line: %s", format_hex_pretty(line).c_str());
           lines.push_back(line);
         }
         line.clear();
@@ -354,10 +375,14 @@ void OBD2BLEClient::parse_response() {
   }
 }
 
-void OBD2BLEClient::parse_data(OBD2Task &task) {
+bool OBD2BLEClient::parse_data(OBD2Task &task) {
   for (const auto &data : task.data) {
     std::string response_str(data.begin(), data.end());
-    if (is_message(response_str, task.command)) continue;
+    if (!is_ready(response_str, task.command)) {
+      ESP_LOGE(TAG, "Task error for command: %s", task.command.c_str());
+      return false;
+    }
+    if (is_message(task, response_str)) continue;
     
     std::string can_id_str;
     std::uint8_t pci;
@@ -386,35 +411,63 @@ void OBD2BLEClient::parse_data(OBD2Task &task) {
         break;
     }
   }
+  return true;
 }
 
-bool OBD2BLEClient::is_message(const std::string &response_str, const std::string &command) {
+bool OBD2BLEClient::is_ready(const std::string &response_str, const std::string &command) {
+  if (response_str.find("UNABLE TO CONNECT") != std::string::npos) {
+    ESP_LOGW(TAG, "ELM not available for command: %s", command.c_str());
+    return false;
+  } else {
+    return true;
+  }
+}
+
+bool OBD2BLEClient::is_message(OBD2Task &task, const std::string &response_str) {
   if (response_str.find("ELM327") != std::string::npos) {
-    ESP_LOGD(TAG, "ELM327 available for command: %s", command.c_str());
+    ESP_LOGD(TAG, "ELM327 available for command: %s", task.command.c_str());
     return true;
   } else if (response_str.find("SEARCHING") != std::string::npos) {
-    ESP_LOGD(TAG, "Searching for command: %s", command.c_str());
+    ESP_LOGD(TAG, "Searching for command: %s", task.command.c_str());
     return true;
   } else if (response_str.find("OK") != std::string::npos) {
-    ESP_LOGD(TAG, "Response OK for command: %s", command.c_str());
+    ESP_LOGD(TAG, "Response OK for command: %s", task.command.c_str());
     return true;
   } else if (response_str.find("NO DATA") != std::string::npos) {
-    ESP_LOGD(TAG, "No Data for command: %s", command.c_str());
+    ESP_LOGD(TAG, "No data for command: %s", task.command.c_str());
     return true;
-  } else if (response_str.find(command) != std::string::npos) {
-    ESP_LOGD(TAG, "Echo received for command: %s", command.c_str());
+  } else if (response_str.find("BUFFER FULL") != std::string::npos) {
+    ESP_LOGD(TAG, "No enough buffer for command: %s", task.command.c_str());
     return true;
-  } else if (response_str.find("A0") != std::string::npos) {
-    ESP_LOGD(TAG, "Response A0 for command: %s", command.c_str());
+  } else if (response_str.find(task.command) != std::string::npos) {
+    ESP_LOGD(TAG, "Echo received for command: %s", task.command.c_str());
+    return true;
+  } else if (response_str == "A0") {
+    ESP_LOGD(TAG, "Response A0 for command: %s", task.command.c_str());
+    return true;
+  } else if (response_str == "7") {
+    ESP_LOGD(TAG, "Response 7 for command: %s", task.command.c_str());
+    return true;
+  } else if (response_str == "6") {
+    ESP_LOGD(TAG, "Response 6 for command: %s", task.command.c_str());
     return true;
   } else if (response_str.find(">") != std::string::npos) {
-    ESP_LOGD(TAG, "Prompt '>' received for command: %s", command.c_str());
+    ESP_LOGD(TAG, "Prompt '>' received for command: %s", task.command.c_str());
     return true;
   } else if (response_str.find("?") != std::string::npos) {
-    ESP_LOGD(TAG, "Error '?' received for command: %s", command.c_str());
+    ESP_LOGD(TAG, "Error '?' received for command: %s", task.command.c_str());
     return true;
   } else {
-    return false;
+    std::regex atrv_regex(R"((\d+\.\d*)V)");
+    std::smatch atrv_match;
+    if (std::regex_search(response_str, atrv_match, atrv_regex)) {
+      if (task.command == "ATRV") {
+        task.value_f = std::stof(atrv_match[1]);
+      }
+      return true;
+    } else {
+      return false;
+    }
   }
 }
 
@@ -529,48 +582,35 @@ void OBD2BLEClient::parse_payload(OBD2Task &task, std::string &can_id_str, uint8
     ESP_LOGE(TAG, "Unexpected data size, Length: %s, Data size: %s", format_hex_pretty(length).c_str(), format_hex_pretty(response_data.size()).c_str());
     return;
   }
+  // Parsing OBD-II Modes
   switch (response_data[0]) {
     case 0x41:  // Mode 01
       if (response_data[1] == 0x00 || response_data[1] == 0x20 || response_data[1] == 0x40 || response_data[1] == 0x60 || response_data[1] == 0x80 || response_data[1] == 0xA0 || response_data[1] == 0xC0) {
         std::string pids_str;
-        std::vector<uint8_t> pids;
-        tie(pids_str, pids) = list_supported_pids(response_data);
-        if (!pids_str.empty() || !pids.empty()) {
-          ESP_LOGI(TAG, "CAN ID: %s, Mode: %s, Supported PIDs: %s, total %d", can_id_str.c_str(), format_hex_pretty(response_data[0]).c_str(), pids_str.c_str(), pids.size());
+        size_t pids_num;
+        tie(pids_str, pids_num) = list_supported_pids(response_data, false);
+        if (!pids_str.empty() || pids_num == 0) {
+          ESP_LOGI(TAG, "CAN ID: %s, Mode: %s, Supported PIDs: %s, total %d", can_id_str.c_str(), format_hex_pretty(response_data[0]).c_str(), pids_str.c_str(), pids_num);
         }
       } else {
         if (task.can_id == can_id_str) {
           handle_mode_01(task, response_data);
-          if (!std::isnan(task.value_f) && task.sensor != nullptr) {
-            task.sensor->publish_state(task.value_f);
-            task.published = true;
-          } else if (!task.value_s.empty() && task.text_sensor != nullptr) {
-            task.text_sensor->publish_state(task.value_s);
-            task.published = true;
-          } else {
-            ESP_LOGW(TAG, "Sensor object is null, cannot publish state.");
-          }
         }
       }
       break;
     case 0x45:  // Mode 05
+      break;
     case 0x46:  // Mode 06
-      if (response_data[1] == 0x00) {
+      if (response_data[1] == 0x00 || response_data[1] == 0x20 || response_data[1] == 0x40 || response_data[1] == 0x60 || response_data[1] == 0x80 || response_data[1] == 0xA0) {
         std::string pids_str;
-        std::vector<uint8_t> pids;
-        tie(pids_str, pids) = list_supported_pids(response_data);
-        if (!pids_str.empty() || !pids.empty()) {
-          ESP_LOGI(TAG, "CAN ID: %s, Mode: %s, Supported PIDs: %s, total %d", can_id_str.c_str(), format_hex_pretty(response_data[0]).c_str(), pids_str.c_str(), pids.size());
+        size_t pids_num;
+        tie(pids_str, pids_num) = list_supported_pids(response_data, false);
+        if (!pids_str.empty() || pids_num == 0) {
+          ESP_LOGI(TAG, "CAN ID: %s, Mode: %s, Supported PIDs: %s, total %d", can_id_str.c_str(), format_hex_pretty(response_data[0]).c_str(), pids_str.c_str(), pids_num);
         }
       } else {
         if (task.can_id == can_id_str) {
           handle_mode_05(task, response_data);
-          if (!std::isnan(task.value_f) && task.sensor != nullptr) {
-            task.sensor->publish_state(task.value_f);
-            task.published = true;
-          } else {
-            ESP_LOGW(TAG, "Sensor object is null, cannot publish state.");
-          }
         }
       }
       break;
@@ -580,95 +620,101 @@ void OBD2BLEClient::parse_payload(OBD2Task &task, std::string &can_id_str, uint8
       if (task.can_id == can_id_str) {
         handle_dtc_response(task, response_data);
         ESP_LOGD(TAG, "DTC codes returned: %s", task.value_s.c_str());
-        if (task.text_sensor != nullptr) {
-          task.text_sensor->publish_state(task.value_s);
-          task.published = true;
-        }
-        for (int i = 0; i < task.codes.size(); ++i) {
-          bool new_state = false;
-          if (!task.value_s.empty()) {
-            new_state = (task.value_s.find(task.codes[i]) != std::string::npos);
-          }
-          if (new_state) {
-            ESP_LOGD(TAG, "DTC code %s found in response", task.codes[i].c_str());
-          }
-          //if (task.binary_sensors[i]->state != new_state) {
-            std::string sensor_name = task.binary_sensors[i]->get_name();
-            if (sensor_name.find(task.codes[i])) {
-              task.binary_sensors[i]->publish_state(new_state);
-              task.published = true;
-              delay(50);
-            } else {
-              ESP_LOGW(TAG, "No match, Code: %s, Sensor: %s", task.codes[i].c_str(), task.binary_sensors[i]->get_name().c_str());
-            }
-          //}
-        }
       }
       break;
     case 0x49:  // Mode 09
       if (response_data[1] == 0x00) {
         std::string pids_str;
-        std::vector<uint8_t> pids;
-        tie(pids_str, pids) = list_supported_pids(response_data);
-        if (!pids_str.empty() || !pids.empty()) {
-          ESP_LOGI(TAG, "CAN ID: %s, Mode: %s, Supported PIDs: %s, total %d", can_id_str.c_str(), format_hex_pretty(response_data[0]).c_str(), pids_str.c_str(), pids.size());
+        size_t pids_num;
+        tie(pids_str, pids_num) = list_supported_pids(response_data, false);
+        if (!pids_str.empty() || pids_num == 0) {
+          ESP_LOGI(TAG, "CAN ID: %s, Mode: %s, Supported PIDs: %s, total %d", can_id_str.c_str(), format_hex_pretty(response_data[0]).c_str(), pids_str.c_str(), pids_num);
         }
       } else {
         if (task.can_id == can_id_str) {
           handle_mode_09(task, response_data);
-          if (!task.value_s.empty() && task.text_sensor != nullptr && task.text_sensor->state != task.value_s) {
-            task.text_sensor->publish_state(task.value_s);
-            task.published = true;
-          }
         }
       }
       break;
+    case 0x62:  // Mode 22
+      if (response_data[2] == 0x00 || response_data[2] == 0x20 || response_data[2] == 0x40 || response_data[2] == 0x60 || response_data[2] == 0x80 || response_data[2] == 0xA0 || response_data[2] == 0xC0 || response_data[2] == 0xE0) {
+        std::string pids_str;
+        size_t pids_num;
+        tie(pids_str, pids_num) = list_supported_pids(response_data, true);
+        if (!pids_str.empty() || pids_num == 0) {
+          ESP_LOGI(TAG, "CAN ID: %s, Mode: %s, Supported PIDs: %s, total %d", can_id_str.c_str(), format_hex_pretty(response_data[0]).c_str(), pids_str.c_str(), pids_num);
+        }
+      } else {
+        handle_mode_22(task, response_data);
+      }
     default:
       break;
   }
 }
 
-std::tuple<std::string, std::vector<uint8_t>> OBD2BLEClient::list_supported_pids(const std::vector<uint8_t> &response_data) {
+std::tuple<std::string, size_t> OBD2BLEClient::list_supported_pids(const std::vector<uint8_t> &response_data, bool is_two_byte_pid) {
   std::string supported_pids_str;
-  std::vector<uint8_t> supported_pids;
+  std::vector<uint8_t> supported_pids_8;
+  std::vector<uint16_t> supported_pids_16;
+  size_t pids_num = 0;
   
   if (response_data.size() < 6) {
     ESP_LOGW(TAG, "Invalid response size for supported PIDs.");
-    return std::make_tuple(supported_pids_str, supported_pids);
+    return std::make_tuple(supported_pids_str, pids_num);
   }
 
   uint8_t mode = response_data[0];
-  uint8_t requested_pid = response_data[1];
-
-  if (mode != 0x41 && mode != 0x46 && mode != 0x49) {
-    ESP_LOGW(TAG, "Invalid response for supported PIDs.");
-    return std::make_tuple(supported_pids_str, supported_pids);
-  }
-
-  int pid_start = requested_pid + 1;
   
-  for (size_t i = 2; i < response_data.size(); i++) {
+  if (mode != 0x41 && mode != 0x46 && mode != 0x49 && mode != 0x62) {
+    ESP_LOGW(TAG, "Invalid response for supported PIDs.");
+    return std::make_tuple(supported_pids_str, pids_num);
+  }
+  
+  uint16_t requested_pid = is_two_byte_pid ? (response_data[1] << 8 | response_data[2]) : response_data[1];
+  
+  int pid_start = requested_pid + 1;
+  size_t data_offset = is_two_byte_pid ? 3 : 2;
+  
+  for (size_t i = data_offset; i < response_data.size(); i++) {
     uint8_t byte_mask = response_data[i];
-
+    
     for (int bit = 0; bit < 8; bit++) {
       if (byte_mask & (1 << (7 - bit))) {
-        uint8_t pid = pid_start + (i - 2) * 8 + bit;
-        supported_pids.push_back(pid);
+        if (is_two_byte_pid) {
+          uint16_t pid = pid_start + (i - data_offset) * 8 + bit;
+          supported_pids_16.push_back(pid);
+        } else {
+          uint8_t pid = pid_start + (i - data_offset) * 8 + bit;
+          supported_pids_8.push_back(pid);
+        }
       }
     }
   }
   
-  char buffer[3];
   std::string delimiter = " ";
-  for (size_t i = 0; i < supported_pids.size(); ++i) {
-    if (i != 0) {
-      supported_pids_str += delimiter;
+  if (is_two_byte_pid) {
+    char buffer[5];
+    for (size_t i = 0; i < supported_pids_16.size(); ++i) {
+      if (i != 0) {
+        supported_pids_str += delimiter;
+      }
+      snprintf(buffer, sizeof(buffer), "%04X", supported_pids_16[i]);
+      supported_pids_str += buffer;
     }
-    snprintf(buffer, sizeof(buffer), "%02X", supported_pids[i]);
-    supported_pids_str += buffer;
+    pids_num = supported_pids_16.size();
+  } else {
+    char buffer[3];
+    for (size_t i = 0; i < supported_pids_8.size(); ++i) {
+      if (i != 0) {
+        supported_pids_str += delimiter;
+      }
+      snprintf(buffer, sizeof(buffer), "%02X", supported_pids_8[i]);
+      supported_pids_str += buffer;
+    }
+    pids_num = supported_pids_8.size();
   }
   
-  return std::make_tuple(supported_pids_str, supported_pids);
+  return std::make_tuple(supported_pids_str, pids_num);
 }
 
 void OBD2BLEClient::handle_mode_01(OBD2Task &task, const std::vector<uint8_t> &data) {
@@ -684,37 +730,37 @@ void OBD2BLEClient::handle_mode_01(OBD2Task &task, const std::vector<uint8_t> &d
       task.value_s = get_fuel_system_status(data[2]);
       break;
     case 0x04:
-      task.value_f = (100/255) * data[2];
+      task.value_f = (100.0/255.0) * data[2];
       break;
     case 0x05:
       task.value_f = data[2] - 40;
       break;
     case 0x06:
-      task.value_f = (100/128) * data[2] - 100;
+      task.value_f = (100.0/128.0) * data[2] - 100.0;
       break;
     case 0x07:
-      task.value_f = (100/128) * data[2] - 100;
+      task.value_f = (100.0/128.0) * data[2] - 100.0;
       break;
     case 0x0B:
       task.value_f = data[2];
       break;
     case 0x0C:
-      task.value_f = ((data[2] * 256) + data[3]) / 4.0;
+      task.value_f = ((data[2] * 256.0) + data[3]) / 4.0;
       break;
     case  0x0D:
       task.value_f = data[2];
       break;
     case 0x0E:
-      task.value_f = (data[2]/2.0) - 64;
+      task.value_f = (data[2]/2.0) - 64.0;
       break;
     case 0x0F:
-      task.value_f = data[2] - 40;
+      task.value_f = data[2] - 40.0;
       break;
     case 0x10:
-      task.value_f = ((data[2] * 256) + data[3]) / 100.0;
+      task.value_f = ((data[2] * 256.0) + data[3]) / 100.0;
       break;
     case 0x11:
-      task.value_f = (100/255) * data[2];
+      task.value_f = (100.0/255.0) * data[2];
       break;
     case 0x13: {
       uint8_t sensor_present = data[2];
@@ -740,93 +786,93 @@ void OBD2BLEClient::handle_mode_01(OBD2Task &task, const std::vector<uint8_t> &d
       }
       break;
     case 0x15:
-      task.value_f = (100/128) * data[3] - 100;
+      task.value_f = (100.0/128.0) * data[3] - 100.0;
       break;
     case 0x1C:
       task.value_s = get_standard_name(data[2]);
       break;
     case 0x1F:
-      task.value_f = (data[2] * 256) + data[3];
+      task.value_f = (data[2] * 256.0) + data[3];
       break;
     case 0x21:
-      task.value_f = (data[2] * 256) + data[3];
+      task.value_f = (data[2] * 256.0) + data[3];
       break;
     case 0x24:
-      task.value_f = (2/65536) * ((256 * data[2]) + data[3]);
+      task.value_f = (2.0/65536.0) * ((256.0 * data[2]) + data[3]);
       break;
     case 0x2C:
-      task.value_f = (100/255) * data[2];
+      task.value_f = (100.0/255.0) * data[2];
       break;
     case 0x2D:
-      task.value_f = (100/128) * data[2] - 100;
+      task.value_f = (100.0/128.0) * data[2] - 100.0;
       break;
     case 0x2E:
-      task.value_f = (100/255) * data[2];
+      task.value_f = (100.0/255.0) * data[2];
       break;
     case 0x2F:
-      task.value_f = (100/255) * data[2];
+      task.value_f = (100.0/255.0) * data[2];
       break;
     case 0x30:
       task.value_f = data[2];
       break;
     case 0x31:
-      task.value_f = (256 * data[2]) + data[3];
+      task.value_f = (256.0 * data[2]) + data[3];
       break;
     case 0x33:
       task.value_f = data[2];
       break;
     case 0x34:
-      task.value_f = (2/65536) * ((256 * data[2]) + data[3]);
+      task.value_f = (2.0/65536.0) * ((256.0 * data[2]) + data[3]);
       break;
     case 0x3C:
-      task.value_f = (((256 * data[2]) + data[3]) / 10.0) - 40;
+      task.value_f = (((256.0 * data[2]) + data[3]) / 10.0) - 40.0;
       break;
     case 0x41:
       break;
     case 0x42:
-      task.value_f = ((256 * data[2]) + data[3]) / 1000.0;
+      task.value_f = ((256.0 * data[2]) + data[3]) / 1000.0;
       break;
     case 0x43:
-      task.value_f = (100/255) * ((256 * data[2]) + data[3]);
+      task.value_f = (100.0/255.0) * ((256.0 * data[2]) + data[3]);
       break;
     case 0x44:
-      task.value_f = (2/65536) * ((256 * data[2]) + data[3]);
+      task.value_f = (2.0/65536.0) * ((256.0 * data[2]) + data[3]);
       break;
     case 0x45:
-      task.value_f = (100/255) * data[2];
+      task.value_f = (100.0/255.0) * data[2];
       break;
     case 0x46:
-      task.value_f = data[2] - 40;
+      task.value_f = data[2] - 40.0;
       break;
     case 0x47:
-      task.value_f = (100/255) * data[2];
+      task.value_f = (100.0/255.0) * data[2];
       break;
     case 0x49:
-      task.value_f = (100/255) * data[2];
+      task.value_f = (100.0/255.0) * data[2];
       break;
     case 0x4A:
-      task.value_f = (100/255) * data[2];
+      task.value_f = (100.0/255.0) * data[2];
       break;
     case 0x4C:
-      task.value_f = (100/255) * data[2];
+      task.value_f = (100.0/255.0) * data[2];
       break;
     case 0x4D:
-      task.value_f = (256 * data[2]) + data[3];
+      task.value_f = (256.0 * data[2]) + data[3];
       break;
     case 0x4E:
-      task.value_f = (256 * data[2]) + data[3];
+      task.value_f = (256.0 * data[2]) + data[3];
       break;
     case 0x51:
       task.value_s = get_fuel_type(data[2]);
       break;
     case 0x53:
-      task.value_f = ((256 * data[2]) + data[3]) / 200.0;
+      task.value_f = ((256.0 * data[2]) + data[3]) / 200.0;
       break;
     case 0x5A:
-      task.value_f = (100/255) * data[2];
+      task.value_f = (100.0/255.0) * data[2];
       break;
     case 0x5C:
-      task.value_f = data[2] - 40;
+      task.value_f = data[2] - 40.0;
       break;
     case 0x65:
       break;
@@ -834,9 +880,9 @@ void OBD2BLEClient::handle_mode_01(OBD2Task &task, const std::vector<uint8_t> &d
       uint8_t sensor_present = data[2];
       if (sensor_present != 0x00) {
         if (is_bit_set(sensor_present, 0)) {
-          task.value_f = data[3] - 40;
+          task.value_f = data[3] - 40.0;
         } else if (is_bit_set(sensor_present, 1)) {
-          task.value_f = data[4] - 40;
+          task.value_f = data[4] - 40.0;
         }
       }
       }
@@ -862,10 +908,45 @@ void OBD2BLEClient::handle_mode_05(OBD2Task &task, const std::vector<uint8_t> &d
 }
 
 void OBD2BLEClient::handle_mode_06(OBD2Task &task, const std::vector<uint8_t> &data) {
-  std::string tid = format_hex(data[1]);
-  std::string cid = format_hex(data[2]);
-  task.value_f = data[3]; // Example
-  // Handle Mode 06 specific logic here
+  task.value_f = 0;
+  task.value_s = "";
+  uint8_t pid = data[1];
+  
+  switch (pid) {
+    case 0x01:
+      break;
+    case 0x02:
+      break;
+    case 0x21:
+      break;
+    case 0x31:
+      break;
+    case 0x35:
+      break;
+    case 0x36:
+      break;
+    case 0x3C:
+      break;
+    case 0x3D:
+      break;
+    case 0x41:
+      break;
+    case 0x42:
+      break;
+    case 0xA1:
+      break;
+    case 0xA2:
+      break;
+    case 0xA3:
+      break;
+    case 0xA4:
+      break;
+    case 0xA5:
+      break;
+    default:
+      ESP_LOGD(TAG, "Unsupported PID: %02X", pid);
+      break;
+  }
 }
 
 void OBD2BLEClient::handle_mode_09(OBD2Task &task, const std::vector<uint8_t> &data) {
@@ -881,27 +962,55 @@ void OBD2BLEClient::handle_mode_09(OBD2Task &task, const std::vector<uint8_t> &d
       break;
     case 0x04: {
       std::string calibration_id(data.begin() + 3, data.end());
-      ESP_LOGI(TAG, "Calibration ID: %s", calibration_id.c_str());
+      task.value_s = calibration_id;
       break;
     }
     case 0x06: {
-      std::string cvn;
       for (size_t i = 3; i < data.size(); ++i) {
-        cvn += format_hex_pretty(data[i]);
+        task.value_s += format_hex_pretty(data[i]);
       }
-      ESP_LOGI(TAG, "CVN: %s", cvn.c_str());
       break;
     }
     case 0x08: {
       ESP_LOGI(TAG, "In-use tracking data: %s", format_hex_pretty(data).c_str());
+      std::vector<uint8_t> items(data.begin() + 3, data.end());
+      bool first = true;
+      for (size_t i = 0; i < items.size(); i += 2) {
+        uint16_t value = (items[i] << 8) | items[i + 1];
+        if (!first) {
+          task.value_s += ", ";
+        }
+        first = false;
+        task.value_s += get_ipt_name(i) + "/" + std::to_string(value);
+      }
       break;
     }
     case 0x0A: {
       std::string ecu_name(data.begin() + 3, data.end());
-      ESP_LOGI(TAG, "ECU Name: %s", ecu_name.c_str());
+      task.value_s = ecu_name;
       break;
     }
     case 0x14: break;
+    default: break;
+  }
+}
+
+void OBD2BLEClient::handle_mode_22(OBD2Task &task, const std::vector<uint8_t> &data) {
+  uint16_t pid = (data[1] << 8) | data[2];
+  switch (pid) {
+    case 0x10A6:
+    case 0x10B2:
+    case 0x10B4:
+    case 0x10B5:
+    case 0x10E3:
+    case 0x1121:
+    case 0x1137:
+    case 0x1231:
+    case 0x1232:
+    case 0x1233:
+    case 0x1234:
+    case 0x124A:
+    case 0x124C:
     default: break;
   }
 }
@@ -944,16 +1053,16 @@ void OBD2BLEClient::handle_dtc_response(OBD2Task &task, const std::vector<uint8_
 }
 
 std::string OBD2BLEClient::get_monitor_status(const std::vector<uint8_t> &data) {
-  std::string value = "Monitor Status:";
+  std::string value = "";
   
   if (is_bit_set(data[2], 7)) {
-    value += " MIL/on";
+    value += "MIL/on";
   } else {
-    value += " MIL/off";
+    value += "MIL/off";
   }
   
   if (is_bit_set(data[3], 0) && !is_bit_set(data[3], 4)) {
-    value += " Misfire/completed";
+    value += ", Misfire/completed";
   } else if (is_bit_set(data[3], 0) && is_bit_set(data[3], 4)) {
     value += ", Misfire/noncomplete";
   }
@@ -1101,16 +1210,78 @@ bool OBD2BLEClient::is_bit_set(const uint8_t &value, const int &position) {
   return (value & mask) != 0;
 }
 
+std::string OBD2BLEClient::get_ipt_name(const size_t &num) {
+  switch (num) {
+    case 0: return "OBDCOND";
+    case 2: return "IGNCNTR";
+    case 4: return "CATCOMP1";
+    case 6: return "CATCOND1";
+    case 8: return "CATCOMP2";
+    case 10: return "CATCOND2";
+    case 12: return "O2SCOMP1";
+    case 14: return "O2SCOND1";
+    case 16: return "O2SCOMP2";
+    case 18: return "O2SCOND2";
+    case 20: return "EGRCOMP";
+    case 22: return "EGRCOND";
+    case 24: return "AIRCOMP";
+    case 26: return "AIRCOND";
+    case 28: return "EVAPCOMP";
+    case 30: return "EVAPCOND";
+    case 32: return "SO2SCOMP1";
+    case 34: return "SO2SCOND1";
+    case 36: return "SO2SCOMP2";
+    case 38: return "SO2SCOND2";
+    default: return "Unknown";
+  }
+}
+
+void OBD2BLEClient::publish_data(OBD2Task &task) {
+  if (!std::isnan(task.value_f) && task.sensor != nullptr) {
+    task.sensor->publish_state(task.value_f);
+    task.published = true;
+  } else if (!task.value_s.empty() && task.text_sensor != nullptr && task.codes.empty()) {
+    task.text_sensor->publish_state(task.value_s);
+    task.published = true;
+  } else if (!task.codes.empty() && task.text_sensor != nullptr) {
+    if (current_code_index_ < task.codes.size()) {
+      bool code_state = false;
+      if (!task.value_s.empty()) {
+        code_state = (task.value_s.find(task.codes[current_code_index_]) != std::string::npos);
+        if (code_state) {
+          ESP_LOGI(TAG, "DTC code %s found in response", task.codes[current_code_index_].c_str());
+        }
+      }
+      std::string sensor_name = task.binary_sensors[current_code_index_]->get_name();
+      if (sensor_name.find(task.codes[current_code_index_])) {
+        task.binary_sensors[current_code_index_]->publish_state(code_state);
+        ESP_LOGD(TAG, "Published Code: %s", task.codes[current_code_index_].c_str());
+      } else {
+        ESP_LOGW(TAG, "No match, Code: %s, Sensor: %s", task.codes[current_code_index_].c_str(), task.binary_sensors[current_code_index_]->get_name().c_str());
+      }
+      current_code_index_++;
+    } else {
+      ESP_LOGD(TAG, "Code publishing completed");
+      task.text_sensor->publish_state(task.value_s);
+      task.published = true;
+    }
+  } else {
+    task.published = true;
+  }
+}
+
 void OBD2BLEClient::cleanup() {
   ESP_LOGW(TAG, "Cleaning up...");
   mtu_configured_ = false;
   notifications_ready_ = false;
   descr_write_done_ = false;
   current_task_index_ = 0;
+  current_code_index_ = 0;
   for (auto &task : task_queue_) {
     task.status = PENDING;
     task.data.clear();
     task.can_id_map.clear();
+    task.published = false;
   }
 }
 

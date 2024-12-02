@@ -34,6 +34,9 @@ class OBD2BLEClient : public esphome::ble_client::BLEClientNode, public Componen
   void set_init_commands(const std::vector<std::string> commands) { this->init_commands_ = commands; }
   void set_command_delay(const int delay) { this->command_delay_ = delay; }
   void set_command_wait(const int wait) { this->command_wait_ = wait; }
+  void set_response_wait(const int wait) { this->response_wait_ = wait; }
+  void set_publish_delay(const int delay) { this->publish_delay_ = delay; }
+  void set_disconnect_delay(const int delay) { this->disconnect_delay_ = delay; }
   
   // Sensor management
   void add_task_for_sensor(sensor::Sensor *sensor, const std::string &can_id, const std::string &mode, const std::string &pid);
@@ -57,8 +60,8 @@ class OBD2BLEClient : public esphome::ble_client::BLEClientNode, public Componen
   std::string notify_char_uuid_str_;
   
   // BLE state tracking
-  uint8_t gattc_if_;  // GATT Client interface
-  uint16_t conn_id_;  // Connection ID
+  uint8_t gattc_if_;
+  uint16_t conn_id_;
   bool mtu_configured_ = false;
   bool notifications_ready_ = false;
   bool descr_write_done_ = false;
@@ -75,7 +78,7 @@ class OBD2BLEClient : public esphome::ble_client::BLEClientNode, public Componen
   // OBD2 task
   std::vector<std::string> init_commands_;
   enum FrameType { SINGLE, FIRST, CONSECUTIVE, UNKNOWN };
-  enum TaskStatus { PENDING, SENDING, SENT, RECEIVED, DONE, ERROR };
+  enum TaskStatus { PENDING, SENDING, SENT, RECEIVED, PUBLISHING, DONE, ERROR };
   struct FrameData {
     uint8_t total_length;
     size_t received_count;
@@ -104,13 +107,16 @@ class OBD2BLEClient : public esphome::ble_client::BLEClientNode, public Componen
   std::string init_commands_str_;
   int command_delay_;
   int command_wait_;
-  int protocol_;
+  int response_wait_;
+  int publish_delay_;
+  int disconnect_delay_;
   
   // OBD2 handlers
-  void process_task(OBD2Task &task, const int &delay, const int &wait);
+  void process_task(OBD2Task &task, const int &command_delay, const int &command_wait, const int &response_wait, const int &publish_delay, const int &disconnect_delay);
   void parse_response();
-  void parse_data(OBD2Task &task);
-  bool is_message(const std::string &response_str, const std::string &command);
+  bool parse_data(OBD2Task &task);
+  bool is_ready(const std::string &response_str, const std::string &command);
+  bool is_message(OBD2Task &task, const std::string &response_str);
   std::tuple<std::string, std::uint8_t, std::uint8_t, std::string> split_data(std::string &data_str);
   std::vector<uint8_t> decode_data(const std::string &response_data_str);
   std::vector<uint8_t> ascii_hex_to_bytes(const std::vector<uint8_t> &ascii_data);
@@ -118,17 +124,20 @@ class OBD2BLEClient : public esphome::ble_client::BLEClientNode, public Componen
   void handle_first_frame(OBD2Task &task, std::string &can_id_str, uint8_t length, const std::vector<uint8_t> &response_data);
   void handle_consecutive_frame(OBD2Task &task, std::string &can_id_str, const std::vector<uint8_t> &response_data);
   void parse_payload(OBD2Task &task, std::string &can_id_str, uint8_t &length, std::vector<uint8_t> &response_data);
-  std::tuple<std::string, std::vector<uint8_t>> list_supported_pids(const std::vector<uint8_t> &response_data);
+  std::tuple<std::string, size_t> list_supported_pids(const std::vector<uint8_t> &response_data, bool is_two_byte_pid);
   void handle_mode_01(OBD2Task &task, const std::vector<uint8_t> &data);
   void handle_mode_05(OBD2Task &task, const std::vector<uint8_t> &data);
   void handle_mode_06(OBD2Task &task, const std::vector<uint8_t> &data);
   void handle_mode_09(OBD2Task &task, const std::vector<uint8_t> &data);
+  void handle_mode_22(OBD2Task &task, const std::vector<uint8_t> &data);
   void handle_dtc_response(OBD2Task &task, const std::vector<uint8_t> &data);
   std::string get_monitor_status(const std::vector<uint8_t> &data);
   std::string get_fuel_system_status(const uint8_t &num);
   std::string get_standard_name(const uint8_t &num);
   std::string get_fuel_type(const uint8_t &num);
   bool is_bit_set(const uint8_t &value, const int &position);
+  std::string get_ipt_name(const size_t &num);
+  void publish_data(OBD2Task &task);
   void cleanup();
   
  private:
@@ -136,6 +145,8 @@ class OBD2BLEClient : public esphome::ble_client::BLEClientNode, public Componen
   std::string last_command_;
   unsigned long last_command_time_ = 0;
   std::vector<uint8_t> response_buffer_;
+  size_t current_code_index_ = 0;
+  unsigned long last_publish_time_ = 0;
   
 };
 
